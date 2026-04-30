@@ -16,6 +16,7 @@
 # -AssembliesToExcludeFilePath  : The full path to the file containing the assemblies to exclude from the report. By default, it is "ApiDiffAssembliesToExclude.txt" in the same folder as this script.
 # -PreviousNuGetFeed            : The NuGet feed URL to use for downloading previous/before packages. By default, uses the dotnet-public feed.
 # -CurrentNuGetFeed             : The NuGet feed URL to use for downloading current/after packages. By default, uses the dotnet-public feed.
+# -AzureDevOpsPat               : Optional Azure DevOps PAT (Packaging: Read) used to authenticate to private NuGet feeds hosted on Azure DevOps (pkgs.dev.azure.com). Defaults to the AZURE_DEVOPS_PAT environment variable.
 # -ExcludeNetCore               : Switch to exclude the NETCore comparison.
 # -ExcludeAspNetCore            : Switch to exclude the AspNetCore comparison.
 # -ExcludeWindowsDesktop        : Switch to exclude the WindowsDesktop comparison.
@@ -104,7 +105,27 @@ Param (
     [Parameter(Mandatory = $false)]
     [string]
     $CurrentVersion = ""
+    ,
+    [Parameter(Mandatory = $false)]
+    [string]
+    $AzureDevOpsPat = $env:AZURE_DEVOPS_PAT
 )
+
+# Build a PSCredential once for authenticated NuGet calls. The credential is only applied
+# to requests whose host is pkgs.dev.azure.com.
+$script:FeedCred = $null
+If (-not [System.String]::IsNullOrWhiteSpace($AzureDevOpsPat)) {
+    $secure = ConvertTo-SecureString $AzureDevOpsPat -AsPlainText -Force
+    $script:FeedCred = [System.Management.Automation.PSCredential]::new("pat", $secure)
+}
+
+Function Get-FeedAuth {
+    Param ([string] $Uri)
+    If ($script:FeedCred -and $Uri -match '^https://pkgs\.dev\.azure\.com/') {
+        Return @{ Authentication = 'Basic'; Credential = $script:FeedCred }
+    }
+    Return @{}
+}
 
 #######################
 ### Start Functions ###
@@ -220,7 +241,8 @@ Function GetNextVersionFromFeed {
     $currentParsed = ParsePrereleaseLabel $prereleaseLabel
     $currentWeight = GetMilestoneSortWeight $currentParsed.ReleaseKind ([int]$currentParsed.PreviewRCNumber)
 
-    $serviceIndex = Invoke-RestMethod -Uri $feedUrl
+    $feedAuth = Get-FeedAuth $feedUrl
+    $serviceIndex = Invoke-RestMethod -Uri $feedUrl @feedAuth
     $flatContainer = $serviceIndex.resources | Where-Object { $_.'@type' -match 'PackageBaseAddress' } | Select-Object -First 1
     If (-not $flatContainer) { Return $null }
 
@@ -228,7 +250,8 @@ Function GetNextVersionFromFeed {
     $versionsUrl = "${baseUrl}microsoft.netcore.app.ref/index.json"
 
     try {
-        $versionsResult = Invoke-RestMethod -Uri $versionsUrl
+        $versionsAuth = Get-FeedAuth $versionsUrl
+        $versionsResult = Invoke-RestMethod -Uri $versionsUrl @versionsAuth
     }
     catch { Return $null }
 
@@ -259,13 +282,15 @@ Function GetNextVersionFromFeed {
     Write-Color cyan "No newer milestone found for $majorMinor on feed. Probing for $nextMajorMinor..."
 
     try {
-        $nextServiceIndex = Invoke-RestMethod -Uri $feedUrl
+        $nextFeedAuth = Get-FeedAuth $feedUrl
+        $nextServiceIndex = Invoke-RestMethod -Uri $feedUrl @nextFeedAuth
         $nextFlatContainer = $nextServiceIndex.resources | Where-Object { $_.'@type' -match 'PackageBaseAddress' } | Select-Object -First 1
         If (-not $nextFlatContainer) { Return $null }
 
         $nextBaseUrl = $nextFlatContainer.'@id'
         $nextVersionsUrl = "${nextBaseUrl}microsoft.netcore.app.ref/index.json"
-        $nextVersionsResult = Invoke-RestMethod -Uri $nextVersionsUrl
+        $nextVersionsAuth = Get-FeedAuth $nextVersionsUrl
+        $nextVersionsResult = Invoke-RestMethod -Uri $nextVersionsUrl @nextVersionsAuth
 
         If ($nextVersionsResult.versions -and $nextVersionsResult.versions.Count -gt 0) {
             ForEach ($v in $nextVersionsResult.versions) {
@@ -307,7 +332,8 @@ Function DiscoverVersionFromFeed {
 
     Write-Color cyan "Discovering $label version of $refPackageName from feed '$feedUrl'..."
 
-    $serviceIndex = Invoke-RestMethod -Uri $feedUrl
+    $feedAuth = Get-FeedAuth $feedUrl
+    $serviceIndex = Invoke-RestMethod -Uri $feedUrl @feedAuth
     $flatContainer = $serviceIndex.resources | Where-Object { $_.'@type' -match 'PackageBaseAddress' } | Select-Object -First 1
 
     If (-not $flatContainer) {
@@ -316,7 +342,8 @@ Function DiscoverVersionFromFeed {
 
     $baseUrl = $flatContainer.'@id'
     $versionsUrl = "${baseUrl}${pkgIdLower}/index.json"
-    $versionsResult = Invoke-RestMethod -Uri $versionsUrl
+    $versionsAuth = Get-FeedAuth $versionsUrl
+    $versionsResult = Invoke-RestMethod -Uri $versionsUrl @versionsAuth
 
     If (-not $versionsResult.versions -or $versionsResult.versions.Count -eq 0) {
         Write-Error "No versions of $refPackageName found on feed '$feedUrl'. Please specify -${label}MajorMinor and -${label}PrereleaseLabel explicitly." -ErrorAction Stop
@@ -710,7 +737,8 @@ Function DownloadPackage {
     $refPackageName = "$fullSdkName.Ref"
 
     # Get service index and flat2 base URL (used for both version search and download)
-    $serviceIndex = Invoke-RestMethod -Uri $nuGetFeed
+    $feedAuth = Get-FeedAuth $nuGetFeed
+    $serviceIndex = Invoke-RestMethod -Uri $nuGetFeed @feedAuth
     $flatContainer = $serviceIndex.resources | Where-Object { $_.'@type' -match 'PackageBaseAddress' } | Select-Object -First 1
     $flatBaseUrl = If ($flatContainer) { $flatContainer.'@id' } Else { "" }
 
@@ -741,7 +769,8 @@ Function DownloadPackage {
             Write-Color cyan "Searching for package '$refPackageName' matching '$searchTerm' via flat2 in feed '$nuGetFeed'..."
 
             try {
-                $versionsResult = Invoke-RestMethod -Uri $versionsUrl
+                $versionsAuth = Get-FeedAuth $versionsUrl
+                $versionsResult = Invoke-RestMethod -Uri $versionsUrl @versionsAuth
                 $matchingVersions = @($versionsResult.versions | Where-Object { $_ -Like $searchTerm } | Sort-Object -Descending)
 
                 If ($matchingVersions.Count -gt 0) {
@@ -769,6 +798,7 @@ Function DownloadPackage {
             $searchParams = @{
                 Uri = "$searchUrl`?q=$refPackageName&prerelease=true&take=1"
             }
+            $searchParams += Get-FeedAuth $searchParams.Uri
 
             $searchResults = Invoke-RestMethod @searchParams
 
@@ -806,7 +836,8 @@ Function DownloadPackage {
         }
 
         Write-Color yellow "Downloading '$nupkgUrl' to '$nupkgFile'..."
-        Invoke-WebRequest -Uri $nupkgUrl -OutFile $nupkgFile
+        $downloadAuth = Get-FeedAuth $nupkgUrl
+        Invoke-WebRequest -Uri $nupkgUrl -OutFile $nupkgFile @downloadAuth
         VerifyPathOrExit $nupkgFile
     }
     Else {
