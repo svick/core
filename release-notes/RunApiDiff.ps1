@@ -1,4 +1,4 @@
-﻿# This script allows running API-diff to generate the dotnet/core report that compares the APIs introduced between two previews, in the format expected for publishing in the dotnet/core repo.
+# This script allows running API-diff to generate the dotnet/core report that compares the APIs introduced between two previews, in the format expected for publishing in the dotnet/core repo.
 
 # Prerequisites:
 # - PowerShell 7.0 or later
@@ -408,7 +408,7 @@ Function RecreateFolder {
     RemoveFolderIfExists $path
 
     Write-Color cyan "Creating new folder: $path"
-    New-Item -ItemType Directory -Path $path
+    New-Item -ItemType Directory -Path $path | Out-Null
 }
 
 Function VerifyCountDlls {
@@ -852,18 +852,13 @@ Function DownloadPackage {
     $resultingPath.value = $dllPath
 }
 
-Function ProcessSdk
+Function PrepareSdk
 {
     Param(
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]
         $sdkName
-    ,
-        [Parameter(Mandatory = $true)]
-        [ValidateNotNullOrEmpty()]
-        [string]
-        $previewFolderPath
     ,
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
@@ -879,36 +874,6 @@ Function ProcessSdk
         [ValidateNotNullOrEmpty()]
         [string]
         $currentNuGetFeed
-    ,
-        [Parameter(Mandatory = $true)]
-        [ValidateNotNullOrEmpty()]
-        [string]
-        $apiDiffExe
-    ,
-        [Parameter(Mandatory = $true)]
-        [ValidateNotNullOrEmpty()]
-        [string]
-        $currentDotNetFullName
-    ,
-        [Parameter(Mandatory = $true)]
-        [ValidateNotNullOrEmpty()]
-        [string]
-        $assembliesToExclude
-    ,
-        [Parameter(Mandatory = $true)]
-        [ValidateNotNullOrEmpty()]
-        [string]
-        $attributesToExclude
-    ,
-        [Parameter(Mandatory = $true)]
-        [ValidateNotNullOrEmpty()]
-        [string]
-        $previousDotNetFriendlyName
-    ,
-        [Parameter(Mandatory = $true)]
-        [ValidateNotNullOrEmpty()]
-        [string]
-        $currentDotNetFriendlyName
     ,
         [Parameter(Mandatory = $true)]
         [ValidatePattern("\d+\.\d")]
@@ -970,10 +935,354 @@ Function ProcessSdk
         VerifyPathOrExit $afterReferenceFolder
     }
 
-    $targetFolder = [IO.Path]::Combine($previewFolderPath, "Microsoft.$sdkName.App")
+    Return [PSCustomObject]@{
+        SdkName = $sdkName
+        BeforeDllFolder = $beforeDllFolder
+        AfterDllFolder = $afterDllFolder
+        BeforeReferenceFolder = $beforeReferenceFolder
+        AfterReferenceFolder = $afterReferenceFolder
+    }
+}
+
+Function RunSdkDiff
+{
+    Param(
+        [Parameter(Mandatory = $true)]
+        $sdkInfo
+    ,
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $previewFolderPath
+    ,
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $apiDiffExe
+    ,
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $tableOfContentsFileNamePrefix
+    ,
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $assembliesToExclude
+    ,
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $attributesToExclude
+    ,
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $previousDotNetFriendlyName
+    ,
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $currentDotNetFriendlyName
+    )
+
+    $targetFolder = [IO.Path]::Combine($previewFolderPath, "Microsoft.$($sdkInfo.SdkName).App")
     RecreateFolder $targetFolder
 
-    RunApiDiff -apiDiffExe $apiDiffExe -outputFolder $targetFolder -beforeFolder $beforeDllFolder -afterFolder $afterDllFolder -tableOfContentsFileNamePrefix $currentDotNetFullName -assembliesToExclude $assembliesToExclude -attributesToExclude $attributesToExclude -beforeFriendlyName $previousDotNetFriendlyName -afterFriendlyName $currentDotNetFriendlyName -beforeReferenceFolder $beforeReferenceFolder -afterReferenceFolder $afterReferenceFolder
+    RunApiDiff -apiDiffExe $apiDiffExe -outputFolder $targetFolder -beforeFolder $sdkInfo.BeforeDllFolder -afterFolder $sdkInfo.AfterDllFolder -tableOfContentsFileNamePrefix $tableOfContentsFileNamePrefix -assembliesToExclude $assembliesToExclude -attributesToExclude $attributesToExclude -beforeFriendlyName $previousDotNetFriendlyName -afterFriendlyName $currentDotNetFriendlyName -beforeReferenceFolder $sdkInfo.BeforeReferenceFolder -afterReferenceFolder $sdkInfo.AfterReferenceFolder
+}
+
+Function GetAssemblyBaseNames {
+    Param (
+        [Parameter(Mandatory = $true)]
+        [string]
+        $folder
+    )
+
+    If (-not $folder -or -not (Test-Path $folder)) { Return @() }
+    Return @(Get-ChildItem -Path $folder -Filter "*.dll" -File | ForEach-Object { $_.BaseName })
+}
+
+# Detects assemblies that moved cleanly between SDKs (present in exactly one before-SDK and
+# exactly one after-SDK, with no overlap). Ambiguous cross-SDK changes are logged and left for
+# normal apidiff behavior. Only considers SDKs that are being processed in this run.
+Function DetectMovedAssemblies {
+    Param (
+        [Parameter(Mandatory = $true)]
+        [hashtable]
+        $sdkInfo
+    )
+
+    $beforeMap = @{}
+    $afterMap  = @{}
+
+    ForEach ($sdk in $sdkInfo.Keys) {
+        ForEach ($asm in (GetAssemblyBaseNames $sdkInfo[$sdk].BeforeDllFolder)) {
+            If (-not $beforeMap.ContainsKey($asm)) { $beforeMap[$asm] = @() }
+            $beforeMap[$asm] += $sdk
+        }
+        ForEach ($asm in (GetAssemblyBaseNames $sdkInfo[$sdk].AfterDllFolder)) {
+            If (-not $afterMap.ContainsKey($asm)) { $afterMap[$asm] = @() }
+            $afterMap[$asm] += $sdk
+        }
+    }
+
+    $allAsms = @($beforeMap.Keys + $afterMap.Keys | Sort-Object -Unique)
+
+    $moves = @()
+    $ambiguous = @()
+    ForEach ($asm in $allAsms) {
+        $beforeSet = If ($beforeMap.ContainsKey($asm)) { @($beforeMap[$asm]) } Else { @() }
+        $afterSet  = If ($afterMap.ContainsKey($asm))  { @($afterMap[$asm])  } Else { @() }
+        $removedFrom  = @($beforeSet | Where-Object { $afterSet -notcontains $_ })
+        $addedTo      = @($afterSet  | Where-Object { $beforeSet -notcontains $_ })
+        $stillIn      = @($beforeSet | Where-Object { $afterSet -contains $_ })
+
+        If ($removedFrom.Count -eq 1 -and $addedTo.Count -eq 1 -and $stillIn.Count -eq 0) {
+            $moves += [PSCustomObject]@{
+                Name    = $asm
+                FromSdk = $removedFrom[0]
+                ToSdk   = $addedTo[0]
+            }
+        }
+        ElseIf ($removedFrom.Count -gt 0 -and $addedTo.Count -gt 0) {
+            $ambiguous += [PSCustomObject]@{
+                Name       = $asm
+                BeforeSdks = $beforeSet
+                AfterSdks  = $afterSet
+            }
+        }
+    }
+
+    If ($ambiguous.Count -gt 0) {
+        Write-Color yellow "Ambiguous cross-SDK assembly changes (left to normal apidiff):"
+        ForEach ($a in $ambiguous) {
+            Write-Color yellow "  $($a.Name): before={$($a.BeforeSdks -join ',')} after={$($a.AfterSdks -join ',')}"
+        }
+    }
+
+    Return $moves
+}
+
+# Writes a per-SDK exclude file combining the user-supplied list with the names of moved
+# assemblies relevant to this SDK (which we'll handle with custom output below).
+Function BuildAugmentedExcludeFile {
+    Param (
+        [Parameter(Mandatory = $true)]
+        [string]
+        $basePath
+    ,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]
+        $additionalAssemblies
+    ,
+        [Parameter(Mandatory = $true)]
+        [string]
+        $tmpFolder
+    ,
+        [Parameter(Mandatory = $true)]
+        [string]
+        $sdkName
+    )
+
+    $existing = If ($basePath -and (Test-Path $basePath)) { @(Get-Content -Path $basePath) } Else { @() }
+
+    $combined = @($existing + $additionalAssemblies) | Sort-Object -Unique
+    $augmentedPath = [IO.Path]::Combine($tmpFolder, "ApiDiffAssembliesToExclude.$sdkName.txt")
+    Set-Content -Path $augmentedPath -Value ($combined -join "`r`n")
+    Return $augmentedPath
+}
+
+# Copy *.dll from $source into $destination, skipping any base names listed in
+# $excludeBaseNames and any file already present at the destination (deterministic precedence).
+Function CopyDllsToFolder {
+    Param (
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]
+        $source
+    ,
+        [Parameter(Mandatory = $true)]
+        [string]
+        $destination
+    ,
+        [Parameter(Mandatory = $false)]
+        [string[]]
+        $excludeBaseNames = @()
+    )
+    If (-not $source -or -not (Test-Path $source)) { Return }
+
+    Get-ChildItem -Path $source -Filter "*.dll" -File | Where-Object {
+        ($excludeBaseNames -notcontains $_.BaseName) -and
+        (-not (Test-Path ([IO.Path]::Combine($destination, $_.Name))))
+    } | ForEach-Object {
+        Copy-Item -Path $_.FullName -Destination $destination
+    }
+}
+
+# Generates the two markdown files for a moved assembly:
+# - FROM-side: a stub note pointing to the new location.
+# - TO-side  : a note pointing to the old location, followed by the cross-SDK API diff.
+Function GenerateMovedAssemblyOutput {
+    Param (
+        [Parameter(Mandatory = $true)]
+        $move
+    ,
+        [Parameter(Mandatory = $true)]
+        [hashtable]
+        $sdkInfo
+    ,
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $previewFolderPath
+    ,
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $tmpFolder
+    ,
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $apiDiffExe
+    ,
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $tableOfContentsFileNamePrefix
+    ,
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $attributesToExclude
+    ,
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $previousDotNetFriendlyName
+    ,
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $currentDotNetFriendlyName
+    )
+
+    $fromInfo = $sdkInfo[$move.FromSdk]
+    $toInfo   = $sdkInfo[$move.ToSdk]
+
+    $fileName   = "${tableOfContentsFileNamePrefix}_$($move.Name).md"
+    $fromFolder = [IO.Path]::Combine($previewFolderPath, "Microsoft.$($move.FromSdk).App")
+    $toFolder   = [IO.Path]::Combine($previewFolderPath, "Microsoft.$($move.ToSdk).App")
+
+    Write-Color cyan "Moved assembly: $($move.Name) ($($move.FromSdk) -> $($move.ToSdk))"
+
+    # FROM-side stub
+    $fromStub = "# $($move.Name)`r`n`r`nThis assembly was moved to [Microsoft.$($move.ToSdk).App](../Microsoft.$($move.ToSdk).App/$fileName).`r`n"
+    Set-Content -Path ([IO.Path]::Combine($fromFolder, $fileName)) -Value $fromStub -NoNewline
+
+    # Build a focused workspace that contains only the moved assembly on each side, with
+    # full reference folders so apidiff can resolve type references.
+    $moveTmp    = [IO.Path]::Combine($tmpFolder, "moves", $move.Name)
+    $beforeOnly = [IO.Path]::Combine($moveTmp, "before")
+    $afterOnly  = [IO.Path]::Combine($moveTmp, "after")
+    $refBefore  = [IO.Path]::Combine($moveTmp, "ref-before")
+    $refAfter   = [IO.Path]::Combine($moveTmp, "ref-after")
+    $moveOut    = [IO.Path]::Combine($moveTmp, "out")
+    RecreateFolder $beforeOnly
+    RecreateFolder $afterOnly
+    RecreateFolder $refBefore
+    RecreateFolder $refAfter
+    RecreateFolder $moveOut
+
+    Copy-Item -Path ([IO.Path]::Combine($fromInfo.BeforeDllFolder, "$($move.Name).dll")) -Destination $beforeOnly
+    Copy-Item -Path ([IO.Path]::Combine($toInfo.AfterDllFolder,    "$($move.Name).dll")) -Destination $afterOnly
+
+    # Combined reference folders: primary SDK DLLs (excluding the moved assembly itself) take
+    # precedence over the supplemental NETCore reference folder.
+    CopyDllsToFolder -source $fromInfo.BeforeDllFolder       -destination $refBefore -excludeBaseNames @($move.Name)
+    CopyDllsToFolder -source $fromInfo.BeforeReferenceFolder -destination $refBefore -excludeBaseNames @($move.Name)
+    CopyDllsToFolder -source $toInfo.AfterDllFolder          -destination $refAfter  -excludeBaseNames @($move.Name)
+    CopyDllsToFolder -source $toInfo.AfterReferenceFolder    -destination $refAfter  -excludeBaseNames @($move.Name)
+
+    $arguments = @(
+        '-b', $beforeOnly, '-a', $afterOnly, '-o', $moveOut,
+        '-tc', $tableOfContentsFileNamePrefix,
+        '-eattrs', $attributesToExclude,
+        '-bfn', $previousDotNetFriendlyName, '-afn', $currentDotNetFriendlyName,
+        '-rb', $refBefore, '-ra', $refAfter
+    )
+    Write-Color yellow "& $apiDiffExe $arguments"
+    & $apiDiffExe @arguments
+    If ($LASTEXITCODE -ne 0) {
+        Write-Error "apidiff failed for moved assembly '$($move.Name)' (exit code $LASTEXITCODE)." -ErrorAction Stop
+    }
+
+    # Compose TO-side file: keep apidiff's heading + body when produced, inject the move note
+    # after the heading. If apidiff produced no file (no diff at all), write our own.
+    $producedFile = [IO.Path]::Combine($moveOut, $fileName)
+    $moveNote = "This assembly was moved from [Microsoft.$($move.FromSdk).App](../Microsoft.$($move.FromSdk).App/$fileName)."
+    $rawDiff = $null
+    If (Test-Path $producedFile) {
+        $rawDiff = Get-Content -Path $producedFile -Raw
+    }
+    If ($rawDiff) {
+        # Insert the move note after apidiff's leading "# <Name>" heading, preserving the rest as-is.
+        $toFinal = $rawDiff -replace "(?s)^(# [^\r\n]*\r?\n\r?\n)", "`$1$moveNote`r`n`r`n"
+    }
+    Else {
+        $toFinal = "# $($move.Name)`r`n`r`n$moveNote`r`n"
+    }
+    Set-Content -Path ([IO.Path]::Combine($toFolder, $fileName)) -Value $toFinal -NoNewline
+}
+
+# Rebuilds the SDK's per-version table-of-contents file so it includes the moved-assembly
+# entries we wrote outside of apidiff, sorted alphabetically with the other entries. The
+# existing TOC header (produced by apidiff) is preserved as-is; only the bullet list is
+# rewritten.
+Function RebuildSdkToc {
+    Param (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $previewFolderPath
+    ,
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $sdkName
+    ,
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $tableOfContentsFileNamePrefix
+    )
+
+    $folder  = [IO.Path]::Combine($previewFolderPath, "Microsoft.$sdkName.App")
+    $tocFile = [IO.Path]::Combine($folder, "$tableOfContentsFileNamePrefix.md")
+
+    $prefixLen = "${tableOfContentsFileNamePrefix}_".Length
+    $entries = Get-ChildItem -Path $folder -Filter "${tableOfContentsFileNamePrefix}_*.md" -File |
+        Sort-Object Name |
+        ForEach-Object {
+            $asm = $_.BaseName.Substring($prefixLen)
+            "* [$asm]($($_.Name))"
+        }
+
+    $existing = Get-Content -Path $tocFile -Raw
+    # Preserve everything up to (but not including) the first bullet entry.
+    $bulletIdx = $existing.IndexOf("`n* [")
+    If ($bulletIdx -ge 0) {
+        $header = $existing.Substring(0, $bulletIdx + 1)
+    }
+    Else {
+        $header = $existing
+        If (-not $header.EndsWith("`n")) { $header += "`r`n" }
+    }
+
+    $body = ($entries -join "`r`n") + "`r`n"
+    Set-Content -Path $tocFile -Value ($header + $body) -NoNewline
 }
 
 #####################
@@ -1175,17 +1484,10 @@ If (-Not $ExcludeNetCore) { $sdksToProcess += "NETCore" }
 If (-Not $ExcludeAspNetCore) { $sdksToProcess += "AspNetCore" }
 If (-Not $ExcludeWindowsDesktop) { $sdksToProcess += "WindowsDesktop" }
 
-$commonParams = @{
-    previewFolderPath = $previewFolderPath
+$prepareParams = @{
     tmpFolder = $TmpFolder
     previousNuGetFeed = $PreviousNuGetFeed
     currentNuGetFeed = $CurrentNuGetFeed
-    apiDiffExe = $apiDiffExe
-    currentDotNetFullName = $currentDotNetFullName
-    assembliesToExclude = $AssembliesToExcludeFilePath
-    attributesToExclude = $AttributesToExcludeFilePath
-    previousDotNetFriendlyName = $previousDotNetFriendlyName
-    currentDotNetFriendlyName = $currentDotNetFriendlyName
     previousMajorMinor = $PreviousMajorMinor
     previousReleaseKind = $PreviousReleaseKind
     previousPreviewRCNumber = $PreviousPreviewRCNumber
@@ -1196,8 +1498,53 @@ $commonParams = @{
     currentVersion = $CurrentVersion
 }
 
+# Phase 1: Download all SDK packages up front so move detection can compare across SDKs.
+$sdkInfo = @{}
 ForEach ($sdk in $sdksToProcess) {
-    ProcessSdk -sdkName $sdk @commonParams
+    Write-Color cyan "Preparing SDK: $sdk"
+    $sdkInfo[$sdk] = PrepareSdk -sdkName $sdk @prepareParams
+}
+
+# Phase 2: Detect assemblies that moved cleanly between SDKs.
+$moves = @(DetectMovedAssemblies -sdkInfo $sdkInfo)
+If ($moves.Count -gt 0) {
+    Write-Color cyan "Detected moved assemblies (handled separately):"
+    ForEach ($m in $moves) {
+        Write-Color cyan "  $($m.Name): $($m.FromSdk) -> $($m.ToSdk)"
+    }
+}
+
+# Phase 3: For each SDK, build an augmented exclude file so that moved assemblies are skipped
+# during the normal per-SDK diff (we generate their files ourselves below).
+$perSdkExcludes = @{}
+ForEach ($sdk in $sdksToProcess) {
+    $touched = @($moves | Where-Object { $_.FromSdk -eq $sdk -or $_.ToSdk -eq $sdk } | ForEach-Object { $_.Name })
+    If ($touched.Count -gt 0) {
+        $perSdkExcludes[$sdk] = BuildAugmentedExcludeFile -basePath $AssembliesToExcludeFilePath -additionalAssemblies $touched -tmpFolder $TmpFolder -sdkName $sdk
+    } Else {
+        $perSdkExcludes[$sdk] = $AssembliesToExcludeFilePath
+    }
+}
+
+# Phase 4: Run the normal per-SDK API diff (with moved assemblies excluded).
+ForEach ($sdk in $sdksToProcess) {
+    RunSdkDiff -sdkInfo $sdkInfo[$sdk] -previewFolderPath $previewFolderPath -apiDiffExe $apiDiffExe -tableOfContentsFileNamePrefix $currentDotNetFullName -assembliesToExclude $perSdkExcludes[$sdk] -attributesToExclude $AttributesToExcludeFilePath -previousDotNetFriendlyName $previousDotNetFriendlyName -currentDotNetFriendlyName $currentDotNetFriendlyName
+}
+
+# Phase 5: Generate the move-aware FROM/TO files for each moved assembly.
+ForEach ($move in $moves) {
+    GenerateMovedAssemblyOutput -move $move -sdkInfo $sdkInfo -previewFolderPath $previewFolderPath -tmpFolder $TmpFolder -apiDiffExe $apiDiffExe -tableOfContentsFileNamePrefix $currentDotNetFullName -attributesToExclude $AttributesToExcludeFilePath -previousDotNetFriendlyName $previousDotNetFriendlyName -currentDotNetFriendlyName $currentDotNetFriendlyName
+}
+
+# Phase 6: For SDKs touched by a move, rebuild the table of contents so the new entries are
+# listed alongside the rest in alphabetical order.
+If ($moves.Count -gt 0) {
+    ForEach ($sdk in $sdksToProcess) {
+        $touched = @($moves | Where-Object { $_.FromSdk -eq $sdk -or $_.ToSdk -eq $sdk })
+        If ($touched.Count -gt 0) {
+            RebuildSdkToc -previewFolderPath $previewFolderPath -sdkName $sdk -tableOfContentsFileNamePrefix $currentDotNetFullName
+        }
+    }
 }
 
 CreateReadme -previewFolderPath $previewFolderPath -dotNetFriendlyName $currentDotNetFriendlyName -dotNetFullName $currentDotNetFullName -sdkNames $sdksToProcess
